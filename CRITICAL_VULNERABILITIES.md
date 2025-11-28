@@ -237,11 +237,166 @@ According to the program guidelines, all users can access tenant tokens. While t
 
 ---
 
+## 4. Command Injection in Workflow CLI Task Execution
+
+### Severity: CRITICAL
+### CWE: CWE-78 (OS Command Injection)
+
+### Description
+The workflow system executes CLI commands from user-controlled input without proper sanitization. While commands are processed through `ProcessJobString` for template variable substitution, there's no validation that prevents command injection through workflow input parameters.
+
+### Location
+- **File**: `backend/services/workflows/app/worker/cli.go` (lines 32-77)
+- **File**: `backend/services/workflows/app/worker/utils.go` (lines 24-35)
+
+### Vulnerable Code
+
+**backend/services/workflows/app/worker/cli.go:32-57**
+```go
+func processCLITask(
+	cliTask *model.CLITask,
+	ps *processor.JobStringProcessor,
+	jp *processor.JobProcessor,
+) (*model.TaskResult, error) {
+	commands := make([]string, 0, 10)
+	for _, command := range cliTask.Command {
+		command := ps.ProcessJobString(command)
+		commands = append(commands, command)
+	}
+	// ...
+	cmd := exec.CommandContext(ctxWithOptionalTimeOut, commands[0], commands[1:]...)
+	// ...
+}
+```
+
+**backend/services/workflows/app/worker/utils.go:24-35**
+```go
+func processJobStringOrFile(data string, ps *processor.JobStringProcessor) (string, error) {
+	data = ps.ProcessJobString(data)
+	if strings.HasPrefix(data, "@") {
+		filePath := data[1:]
+		buffer, err := os.ReadFile(filePath)
+		// No path traversal validation!
+		// ...
+	}
+	return data, nil
+}
+```
+
+### Impact
+1. **Remote Code Execution**: An attacker who can create or trigger workflows with CLI tasks can execute arbitrary commands on the server.
+2. **Server Compromise**: Full system compromise if the workflow service runs with elevated privileges.
+3. **Data Exfiltration**: Access to database credentials, secrets, and sensitive data.
+4. **Path Traversal**: The `processJobStringOrFile` function reads files based on user input without path traversal protection.
+
+### Attack Scenario
+1. An attacker creates or modifies a workflow with a CLI task.
+2. The CLI task command includes workflow input parameters: `["/bin/sh", "-c", "${workflow.input.command}"]`
+3. When the workflow is triggered with `command: "rm -rf / || echo 'pwned'"`, the command is executed.
+4. Alternatively, using file inclusion: `"@/etc/passwd"` could read sensitive files.
+
+### Recommended Fix
+1. **Whitelist allowed commands**: Maintain a list of allowed executables and validate against it.
+2. **Sanitize input parameters**: Escape or validate all workflow input parameters before substitution.
+3. **Path traversal protection**: Validate file paths in `processJobStringOrFile` to prevent directory traversal.
+4. **Restrict workflow creation**: Ensure only authorized users can create/modify workflows with CLI tasks.
+5. **Sandbox execution**: Run CLI tasks in a sandboxed environment with minimal privileges.
+
+### Example Fix
+```go
+var allowedCommands = map[string]bool{
+	"/usr/bin/echo": true,
+	"/bin/cat": true,
+	// ... whitelist
+}
+
+func processCLITask(
+	cliTask *model.CLITask,
+	ps *processor.JobStringProcessor,
+	jp *processor.JobProcessor,
+) (*model.TaskResult, error) {
+	commands := make([]string, 0, 10)
+	for _, command := range cliTask.Command {
+		command := ps.ProcessJobString(command)
+		// Validate first command is whitelisted
+		if len(commands) == 0 {
+			if !allowedCommands[command] {
+				return nil, errors.New("command not allowed")
+			}
+		}
+		// Sanitize arguments
+		command = sanitizeCommandArg(command)
+		commands = append(commands, command)
+	}
+	// ...
+}
+
+func processJobStringOrFile(data string, ps *processor.JobStringProcessor) (string, error) {
+	data = ps.ProcessJobString(data)
+	if strings.HasPrefix(data, "@") {
+		filePath := data[1:]
+		// Validate path to prevent traversal
+		if !filepath.IsAbs(filePath) || strings.Contains(filePath, "..") {
+			return "", errors.New("invalid file path")
+		}
+		// Restrict to allowed directories
+		if !strings.HasPrefix(filePath, "/allowed/dir/") {
+			return "", errors.New("file path not allowed")
+		}
+		buffer, err := os.ReadFile(filePath)
+		// ...
+	}
+	return data, nil
+}
+```
+
+---
+
+## 5. Path Traversal in File Transfer Operations
+
+### Severity: MEDIUM
+### CWE: CWE-22 (Path Traversal)
+
+### Description
+File transfer operations validate that paths are absolute but don't prevent path traversal attacks using `..` sequences. While the validation requires absolute paths, an attacker could potentially use paths like `/etc/../etc/passwd` or `/allowed/path/../../etc/passwd`.
+
+### Location
+- **File**: `backend/services/deviceconnect/model/filetransfer.go` (lines 24-38)
+- **File**: `backend/services/deviceconnect/api/http/management_filetransfer.go` (lines 905-969)
+
+### Vulnerable Code
+
+**backend/services/deviceconnect/model/filetransfer.go:33-37**
+```go
+func (f DownloadFileRequest) Validate() error {
+	return validation.ValidateStruct(&f,
+		validation.Field(&f.Path, validation.Required,
+			validation.Match(absolutePathRegexp).Error("must be absolute")),
+	)
+}
+```
+
+The regex `^/` only checks that the path starts with `/`, but doesn't prevent `../` sequences.
+
+### Impact
+- Unauthorized file access on devices
+- Potential access to sensitive system files
+- Information disclosure
+
+### Recommended Fix
+- Normalize paths using `filepath.Clean()` and validate against allowed directories
+- Reject paths containing `..` sequences
+- Implement a whitelist of allowed directories
+
+---
+
 ## Priority for Remediation
 
 1. **CRITICAL**: RBAC Scope Header Injection (#1) - Immediate fix required
-2. **HIGH**: Missing RBAC Scope Validation (#3) - Fix in next release
-3. **HIGH**: JWT Identity Extraction Without Verification (#2) - Review usage and fix if vulnerable paths exist
+2. **CRITICAL**: Command Injection in Workflow CLI (#4) - Immediate fix required
+3. **HIGH**: Missing RBAC Scope Validation (#3) - Fix in next release
+4. **HIGH**: JWT Identity Extraction Without Verification (#2) - Review usage and fix if vulnerable paths exist
+5. **MEDIUM**: Path Traversal in File Transfer (#5) - Fix in next release
 
 ---
 
@@ -250,4 +405,5 @@ According to the program guidelines, all users can access tenant tokens. While t
 - The vulnerabilities assume that Traefik forwardAuth may be bypassed or that internal service calls don't go through Traefik.
 - Some vulnerabilities may be mitigated by proper Traefik configuration, but defense-in-depth requires server-side validation.
 - The codebase should implement proper authorization checks regardless of reverse proxy configuration.
+- Workflow CLI command injection requires investigation into who can create/modify workflows and what access controls exist.
 
